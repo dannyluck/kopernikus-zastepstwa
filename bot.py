@@ -21,7 +21,7 @@ CHECK_INTERVAL = 60 * 5  # Sprawdzanie co 5 minut
 SEEN_FILE = "last_pdf.json"
 IMAGES_DIR = "images"
 
-WEB_PASSWORD = "piesfiga1"  # Hasło do web panelu
+WEB_PASSWORD = "xnxx123"  # Hasło do web panelu
 
 # Tworzymy folder na obrazy jeśli nie istnieje
 if not os.path.exists(IMAGES_DIR):
