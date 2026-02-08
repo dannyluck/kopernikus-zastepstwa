@@ -4,3 +4,4 @@ beautifulsoup4==4.12.2
 psycopg2-binary==2.9.9
 pytz==2024.1
 lxml
+PyPDF2==3.0.1
