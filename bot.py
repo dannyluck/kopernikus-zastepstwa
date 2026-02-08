@@ -165,6 +165,9 @@ async def fetch_pdf_links():
     """Pobierz linki do PDF-ów ze strony zastępstw"""
     url = "https://kopernikus.pl/zastepstwa"
     
+    # Dzisiejsza data w strefie czasowej szkoły
+    today = datetime.now(TIMEZONE).date()
+    
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=30) as response:
@@ -183,14 +186,26 @@ async def fetch_pdf_links():
                         if match:
                             date_str = match.group(1)
                             version = int(match.group(2))
-                            full_url = f"https://kopernikus.pl{href}" if href.startswith('/') else href
-                            pdf_links.append({
-                                'date': date_str,
-                                'version': version,
-                                'url': full_url
-                            })
+                            
+                            # Parsuj datę
+                            try:
+                                pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                                
+                                # Sprawdź czy to dzisiejsza lub przyszła data
+                                if pdf_date >= today:
+                                    full_url = f"https://kopernikus.pl{href}" if href.startswith('/') else href
+                                    pdf_links.append({
+                                        'date': date_str,
+                                        'version': version,
+                                        'url': full_url
+                                    })
+                                else:
+                                    print(f"⏭️ Pomijam starą datę: {date_str}")
+                            except ValueError:
+                                print(f"⚠️ Nie można sparsować daty: {date_str}")
+                                continue
                     
-                    print(f"🔍 Znaleziono {len(pdf_links)} plików PDF")
+                    print(f"🔍 Znaleziono {len(pdf_links)} aktualnych plików PDF (od dziś)")
                     return pdf_links
                 else:
                     print(f"❌ Błąd HTTP: {response.status}")
@@ -422,7 +437,7 @@ async def on_ready():
         check_zastepstwa_task.start()
         print("🔄 Uruchomiono automatyczne sprawdzanie zastępstw")
 
-@tasks.loop(minutes=30)  # Sprawdzaj co 30 minut
+@tasks.loop(minutes=15)  # Sprawdzaj co 15 minut
 async def check_zastepstwa_task():
     await check_for_changes()
 
@@ -514,6 +529,42 @@ async def status_command(ctx):
         
     except Exception as e:
         await ctx.send(f"❌ Błąd: {e}")
+
+@bot.command(name='debug')
+async def debug_command(ctx):
+    """Debug: pokaż wszystkie znalezione PDF-y na stronie"""
+    await ctx.send("🔍 Szukam PDF-ów na stronie...")
+    
+    url = "https://kopernikus.pl/zastepstwa"
+    today = datetime.now(TIMEZONE).date()
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=30) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    all_pdfs = []
+                    for link in soup.find_all('a', href=True):
+                        href = link['href']
+                        match = re.search(r'/upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
+                        if match:
+                            date_str = match.group(1)
+                            version = int(match.group(2))
+                            pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                            is_future = "✅" if pdf_date >= today else "⏭️"
+                            all_pdfs.append(f"{is_future} {date_str} v{version}")
+                    
+                    if all_pdfs:
+                        pdfs_text = "\n".join(all_pdfs[:20])  # Max 20
+                        await ctx.send(f"📄 Znalezione PDF-y:\n```\n{pdfs_text}\n```\n✅ = aktualny/przyszły | ⏭️ = przeszły\nDzisiaj: {today}")
+                    else:
+                        await ctx.send("❌ Nie znaleziono żadnych PDF-ów")
+                else:
+                    await ctx.send(f"❌ Błąd HTTP: {response.status}")
+        except Exception as e:
+            await ctx.send(f"❌ Błąd: {e}")
 
 # ===== URUCHOMIENIE BOTA =====
 
