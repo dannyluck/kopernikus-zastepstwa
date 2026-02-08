@@ -1,5 +1,5 @@
-discord.py
-aiohttp
-beautifulsoup4
-pymupdf
-pillow
+discord.py==2.3.2
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+psycopg2-binary==2.9.9
+pytz==2023.3
