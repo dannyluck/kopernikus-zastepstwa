@@ -1,5 +1,5 @@
 discord.py
 aiohttp
 beautifulsoup4
-PyMuPDF
-Pillow
+pymupdf
+pillow
