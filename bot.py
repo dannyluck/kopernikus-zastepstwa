@@ -73,9 +73,26 @@ async def fetch_pdf_link(session):
             return f"https://kopernikus.pl{href}"
         return href
 
-async def download_pdf(session, url):
-    async with session.get(url, timeout=30) as r:
-        return await r.read() if r.status == 200 else None
+async def download_pdf(url, filepath):
+    try:
+        # Tworzy foldery nadrzędne (upload/zastepstwa), jeśli nie istnieją
+        directory = os.path.dirname(filepath)
+        if not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+            print(f"📁 Utworzono katalog: {directory}")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    with open(filepath, 'wb') as f:
+                        f.write(await response.read())
+                    return True
+                else:
+                    print(f"❌ Błąd HTTP {response.status} dla URL: {url}")
+                    return False
+    except Exception as e:
+        print(f"❌ Błąd podczas pobierania {filepath}: {e}")
+        return False
 
 async def convert_pdf_to_images(pdf_data, date_str):
     folder = os.path.join(IMAGES_DIR, date_str)
