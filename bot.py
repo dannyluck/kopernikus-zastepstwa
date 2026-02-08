@@ -75,23 +75,28 @@ async def fetch_pdf_link(session):
 
 async def download_pdf(url, filepath):
     try:
-        # Tworzy foldery nadrzędne (upload/zastepstwa), jeśli nie istnieją
-        directory = os.path.dirname(filepath)
-        if not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
-            print(f"📁 Utworzono katalog: {directory}")
+        # Wymuszamy, aby URL był stringiem i usuwamy zbędne spacje
+        url_str = str(url).strip()
+        
+        if not url_str.startswith("http"):
+            print(f"❌ Nieprawidłowy URL: {url_str}")
+            return False
 
+        # Tworzenie folderów
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
+            # Używamy url_str, aby uniknąć błędu "Constructor parameter should be str"
+            async with session.get(url_str, timeout=15) as response:
                 if response.status == 200:
                     with open(filepath, 'wb') as f:
                         f.write(await response.read())
                     return True
                 else:
-                    print(f"❌ Błąd HTTP {response.status} dla URL: {url}")
+                    print(f"❌ Błąd HTTP {response.status} dla {url_str}")
                     return False
     except Exception as e:
-        print(f"❌ Błąd podczas pobierania {filepath}: {e}")
+        print(f"❌ Błąd krytyczny podczas pobierania: {e}")
         return False
 
 async def convert_pdf_to_images(pdf_data, date_str):
