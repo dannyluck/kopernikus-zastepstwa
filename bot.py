@@ -32,6 +32,14 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
+    # Usuń stare tabele jeśli istnieją (migracja)
+    try:
+        cur.execute('DROP TABLE IF EXISTS zastepstwa CASCADE')
+        cur.execute('DROP TABLE IF EXISTS zastepstwa_history CASCADE')
+        print("🗑️ Usunięto stare tabele (migracja)")
+    except Exception as e:
+        print(f"⚠️ Błąd podczas usuwania starych tabel: {e}")
+    
     # Tabela z aktualnymi zastępstwami
     cur.execute('''
         CREATE TABLE IF NOT EXISTS zastepstwa (
