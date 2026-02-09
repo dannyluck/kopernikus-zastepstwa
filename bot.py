@@ -165,8 +165,9 @@ async def fetch_pdf_links():
     """Pobierz linki do PDF-ów ze strony zastępstw"""
     url = "https://kopernikus.pl/zastepstwa"
     
-    # Dzisiejsza data w strefie czasowej szkoły
+    # JUTRO (nie dziś!) - chcemy tylko przyszłe zastępstwa
     today = datetime.now(TIMEZONE).date()
+    tomorrow = today + timedelta(days=1)
     
     async with aiohttp.ClientSession() as session:
         try:
@@ -178,11 +179,11 @@ async def fetch_pdf_links():
                     # Znajdź wszystkie linki do PDF-ów
                     pdf_links = []
                     
-                    # Szukaj linków w formacie: /upload/zastepstwa/YYYY-MM-DD-V.pdf
+                    # Szukaj linków w formacie: /upload/zastepstwa/YYYY-MM-DD-V.pdf lub upload/zastepstwa/YYYY-MM-DD-V.pdf
                     for link in soup.find_all('a', href=True):
                         href = link['href']
-                        # Sprawdź czy to link do PDF zastępstw
-                        match = re.search(r'/upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
+                        # Sprawdź czy to link do PDF zastępstw (może być z / lub bez)
+                        match = re.search(r'/?upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
                         if match:
                             date_str = match.group(1)
                             version = int(match.group(2))
@@ -191,21 +192,28 @@ async def fetch_pdf_links():
                             try:
                                 pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                                 
-                                # Sprawdź czy to dzisiejsza lub przyszła data
-                                if pdf_date >= today:
-                                    full_url = f"https://kopernikus.pl{href}" if href.startswith('/') else href
+                                # Sprawdź czy to PRZYSZŁA data (od jutra)
+                                if pdf_date >= tomorrow:
+                                    # Buduj pełny URL
+                                    if href.startswith('http'):
+                                        full_url = href
+                                    elif href.startswith('/'):
+                                        full_url = f"https://www.kopernikus.pl{href}"
+                                    else:
+                                        full_url = f"https://www.kopernikus.pl/{href}"
+                                    
                                     pdf_links.append({
                                         'date': date_str,
                                         'version': version,
                                         'url': full_url
                                     })
                                 else:
-                                    print(f"⏭️ Pomijam starą datę: {date_str}")
+                                    print(f"⏭️ Pomijam starą/dzisiejszą datę: {date_str}")
                             except ValueError:
                                 print(f"⚠️ Nie można sparsować daty: {date_str}")
                                 continue
                     
-                    print(f"🔍 Znaleziono {len(pdf_links)} aktualnych plików PDF (od dziś)")
+                    print(f"🔍 Znaleziono {len(pdf_links)} przyszłych plików PDF (od jutra: {tomorrow})")
                     return pdf_links
                 else:
                     print(f"❌ Błąd HTTP: {response.status}")
@@ -376,7 +384,7 @@ async def check_for_changes():
     pdf_links = await fetch_pdf_links()
     
     if not pdf_links:
-        print("⚠️ Nie znaleziono linków do PDF-ów")
+        print("⚠️ Nie znaleziono linków do przyszłych PDF-ów")
         return
     
     channel = bot.get_channel(CHANNEL_ID)
@@ -419,7 +427,6 @@ async def check_for_changes():
         # Wyślij powiadomienie
         embed = format_zastepstwa_message(date_str, version, new_zastepstwa, change_type, pdf_url)
         await channel.send(embed=embed)
-        
         print(f"📤 Wysłano powiadomienie dla {date_str} wersja {version} (typ: {change_type})")
 
 # ===== EVENTY I TASKI BOTA =====
@@ -432,10 +439,12 @@ async def on_ready():
     # Inicjalizacja bazy danych
     init_db()
     
+    print("🔍 Bot gotowy - będzie wysyłał powiadomienia tylko o PRZYSZŁYCH zastępstwach (od jutra)")
+    
     # Uruchom task sprawdzający zastępstwa
     if not check_zastepstwa_task.is_running():
         check_zastepstwa_task.start()
-        print("🔄 Uruchomiono automatyczne sprawdzanie zastępstw")
+        print("🔄 Uruchomiono automatyczne sprawdzanie zastępstw co 15 minut")
 
 @tasks.loop(minutes=15)  # Sprawdzaj co 15 minut
 async def check_zastepstwa_task():
@@ -548,7 +557,7 @@ async def debug_command(ctx):
                     all_pdfs = []
                     for link in soup.find_all('a', href=True):
                         href = link['href']
-                        match = re.search(r'/upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
+                        match = re.search(r'/?upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
                         if match:
                             date_str = match.group(1)
                             version = int(match.group(2))
