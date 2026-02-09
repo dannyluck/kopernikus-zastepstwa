@@ -10,7 +10,8 @@ from psycopg2.extras import Json, RealDictCursor
 import pytz
 import re
 import io
-import PyPDF2
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 # Konfiguracja
 intents = discord.Intents.default()
@@ -40,29 +41,17 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Błąd podczas usuwania starych tabel: {e}")
     
-    # Tabela z aktualnymi zastępstwami
+    # Tabela z aktualnymi zastępstwami - przechowuje tylko metadane
     cur.execute('''
         CREATE TABLE IF NOT EXISTS zastepstwa (
             id SERIAL PRIMARY KEY,
             date DATE NOT NULL,
             version INTEGER NOT NULL DEFAULT 0,
             pdf_url TEXT NOT NULL,
-            data JSONB NOT NULL,
+            num_pages INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(date, version)
-        )
-    ''')
-    
-    # Tabela z historią zmian
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS zastepstwa_history (
-            id SERIAL PRIMARY KEY,
-            date DATE NOT NULL,
-            version INTEGER NOT NULL,
-            pdf_url TEXT NOT NULL,
-            data JSONB NOT NULL,
-            saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -71,79 +60,46 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_zastepstwa_date 
         ON zastepstwa(date, version DESC)
     ''')
-    cur.execute('''
-        CREATE INDEX IF NOT EXISTS idx_history_date 
-        ON zastepstwa_history(date, version DESC, saved_at DESC)
-    ''')
     
     conn.commit()
     cur.close()
     conn.close()
     print("✅ Baza danych zainicjalizowana")
 
-def load_json_from_db(date_str, version=None):
-    """Załaduj dane zastępstw z bazy danych"""
+def check_pdf_exists(date_str, version):
+    """Sprawdź czy PDF już istnieje w bazie"""
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        if version is not None:
-            cur.execute('SELECT data, version, pdf_url FROM zastepstwa WHERE date = %s AND version = %s', (date_str, version))
-        else:
-            # Pobierz najnowszą wersję
-            cur.execute('SELECT data, version, pdf_url FROM zastepstwa WHERE date = %s ORDER BY version DESC LIMIT 1', (date_str,))
-        
+        cur = conn.cursor()
+        cur.execute('SELECT pdf_url, num_pages FROM zastepstwa WHERE date = %s AND version = %s', (date_str, version))
         result = cur.fetchone()
         cur.close()
         conn.close()
-        
-        if result:
-            return {
-                'data': result['data'],
-                'version': result['version'],
-                'pdf_url': result['pdf_url']
-            }
-        return None
+        return result is not None
     except Exception as e:
-        print(f"❌ Błąd podczas wczytywania z bazy: {e}")
-        return None
+        print(f"❌ Błąd podczas sprawdzania bazy: {e}")
+        return False
 
-def save_json_to_db(date_str, version, pdf_url, data):
-    """Zapisz dane zastępstw do bazy danych"""
+def save_pdf_metadata(date_str, version, pdf_url, num_pages):
+    """Zapisz metadane PDF do bazy danych"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('''
-            INSERT INTO zastepstwa (date, version, pdf_url, data, updated_at) 
+            INSERT INTO zastepstwa (date, version, pdf_url, num_pages, updated_at) 
             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
             ON CONFLICT (date, version) 
             DO UPDATE SET 
-                data = EXCLUDED.data,
                 pdf_url = EXCLUDED.pdf_url,
+                num_pages = EXCLUDED.num_pages,
                 updated_at = CURRENT_TIMESTAMP
-        ''', (date_str, version, pdf_url, Json(data)))
+        ''', (date_str, version, pdf_url, num_pages))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"💾 Zapisano dane dla {date_str} wersja {version} do bazy")
+        print(f"💾 Zapisano metadane dla {date_str} wersja {version} do bazy")
     except Exception as e:
         print(f"❌ Błąd podczas zapisywania do bazy: {e}")
-
-def save_history_to_db(date_str, version, pdf_url, data):
-    """Zapisz starą wersję zastępstw do historii"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO zastepstwa_history (date, version, pdf_url, data) 
-            VALUES (%s, %s, %s, %s)
-        ''', (date_str, version, pdf_url, Json(data)))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"📜 Zapisano historię dla {date_str} wersja {version}")
-    except Exception as e:
-        print(f"❌ Błąd podczas zapisywania historii: {e}")
 
 def get_all_dates_from_db():
     """Pobierz wszystkie daty z bazy danych"""
@@ -222,160 +178,57 @@ async def fetch_pdf_links():
             print(f"❌ Błąd podczas pobierania listy PDF-ów: {e}")
             return []
 
-async def download_and_parse_pdf(pdf_url):
-    """Pobierz i sparsuj PDF z zastępstwami"""
+async def download_and_convert_pdf(pdf_url):
+    """Pobierz PDF i konwertuj na obrazki"""
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(pdf_url, timeout=30) as response:
                 if response.status == 200:
                     pdf_content = await response.read()
                     
-                    # Parsuj PDF
-                    pdf_file = io.BytesIO(pdf_content)
-                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    # Konwertuj PDF na obrazki (PIL Images)
+                    images = convert_from_bytes(pdf_content, dpi=200)
                     
-                    # Wyciągnij tekst ze wszystkich stron
-                    full_text = ""
-                    for page in pdf_reader.pages:
-                        full_text += page.extract_text() + "\n"
-                    
-                    # Parsuj tekst na strukturę danych
-                    zastepstwa = parse_zastepstwa_from_text(full_text)
-                    
-                    return zastepstwa
+                    print(f"✅ Skonwertowano PDF na {len(images)} stron")
+                    return images
                 else:
                     print(f"❌ Błąd pobierania PDF: {response.status}")
                     return None
         except Exception as e:
-            print(f"❌ Błąd podczas parsowania PDF {pdf_url}: {e}")
+            print(f"❌ Błąd podczas konwersji PDF {pdf_url}: {e}")
             return None
-
-def parse_zastepstwa_from_text(text):
-    """Parsuj tekst z PDF na strukturę zastępstw"""
-    zastepstwa = []
-    
-    # Usuń zbędne białe znaki
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    # Pomiń nagłówki i znajdź dane
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        
-        # Szukaj wzorca zastępstwa
-        # Typowy format: "Lekcja Klasa Przedmiot Nauczyciel Uwagi"
-        # Lub warianty z różnymi formatami
-        
-        # Prosty parser - można rozbudować w zależności od faktycznego formatu PDF
-        # Zakładamy format: numer_lekcji klasa przedmiot nauczyciel uwagi
-        parts = line.split()
-        
-        if len(parts) >= 4:
-            # Spróbuj wyciągnąć dane
-            try:
-                # Pierwszy element to zazwyczaj numer lekcji
-                lekcja = parts[0]
-                
-                # Jeśli pierwszy element to cyfra lub zakres (np. "1", "1-2")
-                if re.match(r'^\d+(-\d+)?$', lekcja):
-                    # Reszta danych
-                    if len(parts) >= 4:
-                        zastepstwo = {
-                            'lekcja': lekcja,
-                            'klasa': parts[1] if len(parts) > 1 else '',
-                            'przedmiot': parts[2] if len(parts) > 2 else '',
-                            'nauczyciel': parts[3] if len(parts) > 3 else '',
-                            'uwagi': ' '.join(parts[4:]) if len(parts) > 4 else ''
-                        }
-                        zastepstwa.append(zastepstwo)
-            except:
-                pass
-        
-        i += 1
-    
-    return zastepstwa
 
 # ===== FUNKCJE PORÓWNYWANIA I POWIADOMIEŃ =====
 
-def compare_zastepstwa(old_record, new_data, new_version):
-    """Porównaj stare i nowe zastępstwa"""
-    if old_record is None:
-        return "new", new_data, new_version
-    
-    old_data = old_record['data']
-    old_version = old_record['version']
-    
-    # Jeśli to ta sama wersja i te same dane
-    if old_version == new_version and old_data == new_data:
-        return "no_change", None, None
-    
-    # Jeśli to nowa wersja
-    if new_version > old_version:
-        return "updated", new_data, new_version
-    
-    # Jeśli dane się zmieniły przy tej samej wersji
-    if old_data != new_data:
-        return "changed", new_data, new_version
-    
-    return "no_change", None, None
-
-def format_zastepstwa_message(date_str, version, zastepstwa_list, change_type, pdf_url):
-    """Formatuj wiadomość Discord"""
-    if change_type == "new":
-        title = f"🆕 Nowe zastępstwa na {date_str}"
-        color = discord.Color.blue()
-    elif change_type == "updated":
-        title = f"🔄 Zaktualizowano zastępstwa na {date_str} (wersja {version})"
-        color = discord.Color.orange()
-    elif change_type == "changed":
-        title = f"⚠️ Zmiana w zastępstwach na {date_str}"
-        color = discord.Color.gold()
-    else:
-        title = f"📋 Zastępstwa na {date_str}"
-        color = discord.Color.green()
-    
-    embed = discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.now(TIMEZONE)
-    )
-    
-    # Dodaj link do PDF
-    embed.add_field(name="📄 Oryginalny PDF", value=f"[Pobierz PDF]({pdf_url})", inline=False)
-    
-    if not zastepstwa_list:
-        embed.description = "Nie udało się sparsować zastępstw z PDF. Sprawdź oryginalny plik."
-        return embed
-    
-    # Grupuj zastępstwa po klasach
-    klasy = {}
-    for z in zastepstwa_list:
-        klasa = z.get('klasa', 'Nieznana')
-        if klasa not in klasy:
-            klasy[klasa] = []
-        klasy[klasa].append(z)
-    
-    # Dodaj pola dla każdej klasy
-    for klasa, zastepstwa in sorted(klasy.items()):
-        zastepstwa_text = ""
-        for z in zastepstwa:
-            zastepstwa_text += f"**Lekcja {z.get('lekcja', '?')}**: {z.get('przedmiot', '?')}\n"
-            if z.get('nauczyciel'):
-                zastepstwa_text += f"Nauczyciel: {z['nauczyciel']}\n"
-            if z.get('uwagi'):
-                zastepstwa_text += f"_{z['uwagi']}_\n"
-            zastepstwa_text += "\n"
+async def send_zastepstwa_notification(channel, date_str, version, pdf_url, images):
+    """Wyślij powiadomienie z obrazkami ze zastępstw"""
+    try:
+        # Informacja o nowych zastępstwach
+        if version == 0:
+            message = f"🆕 **Nowe zastępstwa na {date_str}**"
+        else:
+            message = f"🔄 **Zaktualizowano zastępstwa na {date_str}** (wersja {version})"
         
-        # Discord ma limit 1024 znaków na pole
-        if len(zastepstwa_text) > 1024:
-            zastepstwa_text = zastepstwa_text[:1020] + "..."
+        message += f"\n📄 [Pobierz PDF]({pdf_url})"
+        message += f"\n📄 Liczba stron: {len(images)}"
         
-        embed.add_field(name=f"Klasa {klasa}", value=zastepstwa_text or "Brak danych", inline=False)
-    
-    if not klasy:
-        embed.description = "Brak zastępstw"
-    
-    return embed
+        await channel.send(message)
+        
+        # Wyślij każdą stronę jako osobny obrazek
+        for i, image in enumerate(images, 1):
+            # Konwertuj PIL Image do bytes
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+            
+            # Wyślij jako załącznik
+            file = discord.File(img_byte_arr, filename=f"zastepstwa_{date_str}_v{version}_strona_{i}.png")
+            await channel.send(f"📄 Strona {i}/{len(images)}", file=file)
+        
+        print(f"📤 Wysłano {len(images)} stron dla {date_str} wersja {version}")
+        
+    except Exception as e:
+        print(f"❌ Błąd podczas wysyłania powiadomienia: {e}")
 
 async def check_for_changes():
     """Sprawdź zmiany w zastępstwach"""
@@ -400,34 +253,25 @@ async def check_for_changes():
         
         print(f"📄 Sprawdzam {date_str} wersja {version}")
         
-        # Pobierz i sparsuj PDF
-        new_zastepstwa = await download_and_parse_pdf(pdf_url)
-        
-        if new_zastepstwa is None:
-            print(f"⚠️ Nie udało się pobrać PDF: {pdf_url}")
+        # Sprawdź czy już mamy ten PDF w bazie
+        if check_pdf_exists(date_str, version):
+            print(f"✅ PDF już istnieje w bazie: {date_str} v{version}")
             continue
         
-        # Pobierz stare dane z bazy
-        old_record = load_json_from_db(date_str)
+        # Nowy PDF! Pobierz i konwertuj
+        images = await download_and_convert_pdf(pdf_url)
         
-        # Porównaj
-        change_type, changed_data, changed_version = compare_zastepstwa(old_record, new_zastepstwa, version)
-        
-        if change_type == "no_change":
-            print(f"✅ Brak zmian dla {date_str} wersja {version}")
+        if images is None or len(images) == 0:
+            print(f"⚠️ Nie udało się skonwertować PDF: {pdf_url}")
             continue
         
-        # Zapisz stare dane do historii (jeśli istnieją)
-        if old_record and change_type in ["updated", "changed"]:
-            save_history_to_db(date_str, old_record['version'], old_record['pdf_url'], old_record['data'])
+        # Zapisz metadane do bazy
+        save_pdf_metadata(date_str, version, pdf_url, len(images))
         
-        # Zapisz nowe dane
-        save_json_to_db(date_str, version, pdf_url, new_zastepstwa)
+        # Wyślij powiadomienie z obrazkami
+        await send_zastepstwa_notification(channel, date_str, version, pdf_url, images)
         
-        # Wyślij powiadomienie
-        embed = format_zastepstwa_message(date_str, version, new_zastepstwa, change_type, pdf_url)
-        await channel.send(embed=embed)
-        print(f"📤 Wysłano powiadomienie dla {date_str} wersja {version} (typ: {change_type})")
+        print(f"📤 Wysłano powiadomienie dla {date_str} wersja {version}")
 
 # ===== EVENTY I TASKI BOTA =====
 
@@ -464,32 +308,14 @@ async def sprawdz_command(ctx):
     await check_for_changes()
 
 @bot.command(name='pokaz')
-async def pokaz_command(ctx, date_str: str = None, version: int = None):
-    """Pokaż zastępstwa dla konkretnej daty"""
-    if not date_str:
-        # Pokaż dostępne daty
-        dates = get_all_dates_from_db()
-        if dates:
-            dates_str = "\n".join([f"{d[0]} (wersja {d[1]})" for d in dates])
-            await ctx.send(f"📅 Dostępne daty w bazie:\n```{dates_str}```\nUżyj: `!pokaz YYYY-MM-DD [wersja]`")
-        else:
-            await ctx.send("❌ Brak danych w bazie")
-        return
-    
-    record = load_json_from_db(date_str, version)
-    
-    if not record:
-        await ctx.send(f"❌ Brak danych dla daty: {date_str}" + (f" wersja {version}" if version else ""))
-        return
-    
-    embed = format_zastepstwa_message(
-        date_str, 
-        record['version'], 
-        record['data'], 
-        "show",
-        record['pdf_url']
-    )
-    await ctx.send(embed=embed)
+async def pokaz_command(ctx):
+    """Pokaż zastępstwa zapisane w bazie"""
+    dates = get_all_dates_from_db()
+    if dates:
+        dates_str = "\n".join([f"{d[0]} (wersja {d[1]})" for d in dates])
+        await ctx.send(f"📅 Zastępstwa w bazie:\n```{dates_str}```")
+    else:
+        await ctx.send("❌ Brak danych w bazie")
 
 @bot.command(name='status')
 async def status_command(ctx):
@@ -505,15 +331,12 @@ async def status_command(ctx):
         cur.execute('SELECT COUNT(*) FROM zastepstwa')
         count_versions = cur.fetchone()[0]
         
-        cur.execute('SELECT COUNT(*) FROM zastepstwa_history')
-        count_history = cur.fetchone()[0]
-        
         # Najnowsza aktualizacja
         cur.execute('SELECT MAX(updated_at) FROM zastepstwa')
         last_update = cur.fetchone()[0]
         
         # Najnowsze zastępstwa
-        cur.execute('SELECT date, version FROM zastepstwa ORDER BY date DESC, version DESC LIMIT 3')
+        cur.execute('SELECT date, version, num_pages FROM zastepstwa ORDER BY date DESC, version DESC LIMIT 5')
         latest = cur.fetchall()
         
         cur.close()
@@ -526,12 +349,11 @@ async def status_command(ctx):
         )
         embed.add_field(name="Różnych dat", value=str(count_dates), inline=True)
         embed.add_field(name="Wersji łącznie", value=str(count_versions), inline=True)
-        embed.add_field(name="Wpisów w historii", value=str(count_history), inline=True)
         embed.add_field(name="Ostatnia aktualizacja", value=str(last_update) if last_update else "Brak", inline=False)
         embed.add_field(name="Task aktywny", value="✅ Tak" if check_zastepstwa_task.is_running() else "❌ Nie", inline=True)
         
         if latest:
-            latest_str = "\n".join([f"{row[0]} (v{row[1]})" for row in latest])
+            latest_str = "\n".join([f"{row[0]} (v{row[1]}, {row[2]} stron)" for row in latest])
             embed.add_field(name="Najnowsze zastępstwa", value=latest_str, inline=False)
         
         await ctx.send(embed=embed)
