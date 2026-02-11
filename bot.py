@@ -19,71 +19,114 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 TIMEZONE = pytz.timezone('Europe/Warsaw')
-CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID'))  # ID kanału Discord gdzie bot będzie wysyłał wiadomości
+CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID'))
 DATABASE_URL = os.getenv('DATABASE_URL')
+
+# Connection pool dla bazy danych
+db_pool = None
 
 # ===== FUNKCJE BAZY DANYCH =====
 
+def init_db_pool():
+    """Inicjalizuj connection pool"""
+    global db_pool
+    try:
+        db_pool = psycopg2.pool.SimpleConnectionPool(
+            1, 10,  # min 1, max 10 połączeń
+            DATABASE_URL,
+            connect_timeout=10
+        )
+        print("✅ Pool połączeń z bazą danych zainicjalizowany")
+    except Exception as e:
+        print(f"❌ Błąd inicjalizacji pool: {e}")
+
 def get_db_connection():
-    """Połączenie z bazą danych PostgreSQL"""
-    return psycopg2.connect(DATABASE_URL)
+    """Pobierz połączenie z pool"""
+    try:
+        return db_pool.getconn()
+    except Exception as e:
+        print(f"❌ Błąd pobierania połączenia: {e}")
+        return None
+
+def return_db_connection(conn):
+    """Zwróć połączenie do pool"""
+    try:
+        if conn:
+            db_pool.putconn(conn)
+    except Exception as e:
+        print(f"❌ Błąd zwracania połączenia: {e}")
 
 def init_db():
     """Inicjalizacja tabel w bazie danych"""
     conn = get_db_connection()
-    cur = conn.cursor()
+    if not conn:
+        print("❌ Nie można połączyć z bazą danych!")
+        return
     
-    # Usuń stare tabele jeśli istnieją (migracja)
     try:
-        cur.execute('DROP TABLE IF EXISTS zastepstwa CASCADE')
-        cur.execute('DROP TABLE IF EXISTS zastepstwa_history CASCADE')
-        print("🗑️ Usunięto stare tabele (migracja)")
+        cur = conn.cursor()
+        
+        # Usuń stare tabele jeśli istnieją (migracja)
+        try:
+            cur.execute('DROP TABLE IF EXISTS zastepstwa CASCADE')
+            print("🗑️ Usunięto stare tabele (migracja)")
+        except Exception as e:
+            print(f"⚠️ Błąd podczas usuwania starych tabel: {e}")
+        
+        # Tabela z aktualnymi zastępstwami - przechowuje tylko metadane
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS zastepstwa (
+                id SERIAL PRIMARY KEY,
+                date DATE NOT NULL,
+                version INTEGER NOT NULL DEFAULT 0,
+                pdf_url TEXT NOT NULL,
+                num_pages INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(date, version)
+            )
+        ''')
+        
+        # Indeksy dla lepszej wydajności
+        cur.execute('''
+            CREATE INDEX IF NOT EXISTS idx_zastepstwa_date 
+            ON zastepstwa(date, version DESC)
+        ''')
+        
+        conn.commit()
+        cur.close()
+        print("✅ Baza danych zainicjalizowana")
     except Exception as e:
-        print(f"⚠️ Błąd podczas usuwania starych tabel: {e}")
-    
-    # Tabela z aktualnymi zastępstwami - przechowuje tylko metadane
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS zastepstwa (
-            id SERIAL PRIMARY KEY,
-            date DATE NOT NULL,
-            version INTEGER NOT NULL DEFAULT 0,
-            pdf_url TEXT NOT NULL,
-            num_pages INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(date, version)
-        )
-    ''')
-    
-    # Indeksy dla lepszej wydajności
-    cur.execute('''
-        CREATE INDEX IF NOT EXISTS idx_zastepstwa_date 
-        ON zastepstwa(date, version DESC)
-    ''')
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("✅ Baza danych zainicjalizowana")
+        print(f"❌ Błąd inicjalizacji bazy: {e}")
+    finally:
+        return_db_connection(conn)
 
 def check_pdf_exists(date_str, version):
     """Sprawdź czy PDF już istnieje w bazie"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
     try:
-        conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('SELECT pdf_url, num_pages FROM zastepstwa WHERE date = %s AND version = %s', (date_str, version))
+        cur.execute('SELECT pdf_url FROM zastepstwa WHERE date = %s AND version = %s', (date_str, version))
         result = cur.fetchone()
         cur.close()
-        conn.close()
         return result is not None
     except Exception as e:
         print(f"❌ Błąd podczas sprawdzania bazy: {e}")
         return False
+    finally:
+        return_db_connection(conn)
 
 def save_pdf_metadata(date_str, version, pdf_url, num_pages):
     """Zapisz metadane PDF do bazy danych"""
+    conn = get_db_connection()
+    if not conn:
+        print("❌ Nie można połączyć z bazą")
+        return
+    
     try:
-        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('''
             INSERT INTO zastepstwa (date, version, pdf_url, num_pages, updated_at) 
@@ -96,24 +139,29 @@ def save_pdf_metadata(date_str, version, pdf_url, num_pages):
         ''', (date_str, version, pdf_url, num_pages))
         conn.commit()
         cur.close()
-        conn.close()
         print(f"💾 Zapisano metadane dla {date_str} wersja {version} do bazy")
     except Exception as e:
         print(f"❌ Błąd podczas zapisywania do bazy: {e}")
+    finally:
+        return_db_connection(conn)
 
 def get_all_dates_from_db():
     """Pobierz wszystkie daty z bazy danych"""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    
     try:
-        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute('SELECT DISTINCT date, MAX(version) as latest_version FROM zastepstwa GROUP BY date ORDER BY date DESC')
         dates = [(row[0].strftime('%Y-%m-%d'), row[1]) for row in cur.fetchall()]
         cur.close()
-        conn.close()
         return dates
     except Exception as e:
         print(f"❌ Błąd podczas pobierania dat: {e}")
         return []
+    finally:
+        return_db_connection(conn)
 
 # ===== FUNKCJE SCRAPOWANIA I PARSOWANIA PDF =====
 
@@ -121,9 +169,10 @@ async def fetch_pdf_links():
     """Pobierz linki do PDF-ów ze strony zastępstw"""
     url = "https://kopernikus.pl/zastepstwa"
     
-    # JUTRO (nie dziś!) - chcemy tylko przyszłe zastępstwa
+    # Sprawdzaj tylko JUTRO i POJUTRZE (max 2 dni do przodu)
     today = datetime.now(TIMEZONE).date()
     tomorrow = today + timedelta(days=1)
+    max_date = today + timedelta(days=2)  # Jutro + pojutrze
     
     async with aiohttp.ClientSession() as session:
         try:
@@ -148,8 +197,8 @@ async def fetch_pdf_links():
                             try:
                                 pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                                 
-                                # Sprawdź czy to PRZYSZŁA data (od jutra)
-                                if pdf_date >= tomorrow:
+                                # Sprawdź czy to JUTRO lub POJUTRZE (max 2 dni do przodu)
+                                if tomorrow <= pdf_date <= max_date:
                                     # Buduj pełny URL
                                     if href.startswith('http'):
                                         full_url = href
@@ -164,12 +213,15 @@ async def fetch_pdf_links():
                                         'url': full_url
                                     })
                                 else:
-                                    print(f"⏭️ Pomijam starą/dzisiejszą datę: {date_str}")
+                                    if pdf_date < tomorrow:
+                                        print(f"⏭️ Pomijam starą/dzisiejszą datę: {date_str}")
+                                    else:
+                                        print(f"⏭️ Pomijam zbyt odległą datę: {date_str} (max: {max_date})")
                             except ValueError:
                                 print(f"⚠️ Nie można sparsować daty: {date_str}")
                                 continue
                     
-                    print(f"🔍 Znaleziono {len(pdf_links)} przyszłych plików PDF (od jutra: {tomorrow})")
+                    print(f"🔍 Znaleziono {len(pdf_links)} PDF-ów (jutro-pojutrze: {tomorrow} - {max_date})")
                     return pdf_links
                 else:
                     print(f"❌ Błąd HTTP: {response.status}")
@@ -237,7 +289,7 @@ async def check_for_changes():
     pdf_links = await fetch_pdf_links()
     
     if not pdf_links:
-        print("⚠️ Nie znaleziono linków do przyszłych PDF-ów")
+        print("⚠️ Nie znaleziono PDF-ów na jutro/pojutrze")
         return
     
     channel = bot.get_channel(CHANNEL_ID)
@@ -245,8 +297,10 @@ async def check_for_changes():
         print(f"❌ Nie znaleziono kanału o ID: {CHANNEL_ID}")
         return
     
-    # Sprawdź każdy PDF
-    for pdf_info in pdf_links:
+    # Sprawdź każdy PDF (posortowane od najnowszych)
+    pdf_links_sorted = sorted(pdf_links, key=lambda x: (x['date'], x['version']), reverse=True)
+    
+    for pdf_info in pdf_links_sorted:
         date_str = pdf_info['date']
         version = pdf_info['version']
         pdf_url = pdf_info['url']
@@ -255,23 +309,31 @@ async def check_for_changes():
         
         # Sprawdź czy już mamy ten PDF w bazie
         if check_pdf_exists(date_str, version):
-            print(f"✅ PDF już istnieje w bazie: {date_str} v{version}")
+            print(f"✅ PDF już istnieje w bazie: {date_str} v{version}, pomijam")
             continue
         
         # Nowy PDF! Pobierz i konwertuj
-        images = await download_and_convert_pdf(pdf_url)
-        
-        if images is None or len(images) == 0:
-            print(f"⚠️ Nie udało się skonwertować PDF: {pdf_url}")
+        try:
+            print(f"🆕 Nowy PDF! Pobieram {date_str} v{version}...")
+            images = await download_and_convert_pdf(pdf_url)
+            
+            if images is None or len(images) == 0:
+                print(f"⚠️ Nie udało się skonwertować PDF: {pdf_url}")
+                continue
+            
+            # Zapisz metadane do bazy
+            save_pdf_metadata(date_str, version, pdf_url, len(images))
+            
+            # Wyślij powiadomienie z obrazkami
+            await send_zastepstwa_notification(channel, date_str, version, pdf_url, images)
+            
+            print(f"📤 ✅ Wysłano powiadomienie dla {date_str} wersja {version}")
+            
+        except Exception as e:
+            print(f"❌ Błąd podczas przetwarzania PDF {pdf_url}: {e}")
             continue
-        
-        # Zapisz metadane do bazy
-        save_pdf_metadata(date_str, version, pdf_url, len(images))
-        
-        # Wyślij powiadomienie z obrazkami
-        await send_zastepstwa_notification(channel, date_str, version, pdf_url, images)
-        
-        print(f"📤 Wysłano powiadomienie dla {date_str} wersja {version}")
+    
+    print(f"✅ Zakończono sprawdzanie")
 
 # ===== EVENTY I TASKI BOTA =====
 
