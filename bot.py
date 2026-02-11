@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import Json, RealDictCursor
 import pytz
 import re
@@ -31,17 +32,26 @@ def init_db_pool():
     """Inicjalizuj connection pool"""
     global db_pool
     try:
-        db_pool = psycopg2.pool.SimpleConnectionPool(
+        db_pool = pool.SimpleConnectionPool(
             1, 10,  # min 1, max 10 połączeń
             DATABASE_URL,
             connect_timeout=10
         )
         print("✅ Pool połączeń z bazą danych zainicjalizowany")
+        return True
     except Exception as e:
         print(f"❌ Błąd inicjalizacji pool: {e}")
+        db_pool = None
+        return False
 
 def get_db_connection():
     """Pobierz połączenie z pool"""
+    global db_pool
+    if db_pool is None:
+        print("❌ Pool nie jest zainicjalizowany! Próbuję zainicjalizować...")
+        if not init_db_pool():
+            return None
+    
     try:
         return db_pool.getconn()
     except Exception as e:
@@ -50,9 +60,12 @@ def get_db_connection():
 
 def return_db_connection(conn):
     """Zwróć połączenie do pool"""
+    global db_pool
+    if db_pool is None or conn is None:
+        return
+    
     try:
-        if conn:
-            db_pool.putconn(conn)
+        db_pool.putconn(conn)
     except Exception as e:
         print(f"❌ Błąd zwracania połączenia: {e}")
 
@@ -169,10 +182,9 @@ async def fetch_pdf_links():
     """Pobierz linki do PDF-ów ze strony zastępstw"""
     url = "https://kopernikus.pl/zastepstwa"
     
-    # Sprawdzaj tylko JUTRO i POJUTRZE (max 2 dni do przodu)
+    # Sprawdzaj TYLKO JUTRO
     today = datetime.now(TIMEZONE).date()
     tomorrow = today + timedelta(days=1)
-    max_date = today + timedelta(days=2)  # Jutro + pojutrze
     
     async with aiohttp.ClientSession() as session:
         try:
@@ -197,8 +209,8 @@ async def fetch_pdf_links():
                             try:
                                 pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                                 
-                                # Sprawdź czy to JUTRO lub POJUTRZE (max 2 dni do przodu)
-                                if tomorrow <= pdf_date <= max_date:
+                                # Sprawdź czy to JUTRO
+                                if pdf_date == tomorrow:
                                     # Buduj pełny URL
                                     if href.startswith('http'):
                                         full_url = href
@@ -212,16 +224,11 @@ async def fetch_pdf_links():
                                         'version': version,
                                         'url': full_url
                                     })
-                                else:
-                                    if pdf_date < tomorrow:
-                                        print(f"⏭️ Pomijam starą/dzisiejszą datę: {date_str}")
-                                    else:
-                                        print(f"⏭️ Pomijam zbyt odległą datę: {date_str} (max: {max_date})")
                             except ValueError:
                                 print(f"⚠️ Nie można sparsować daty: {date_str}")
                                 continue
                     
-                    print(f"🔍 Znaleziono {len(pdf_links)} PDF-ów (jutro-pojutrze: {tomorrow} - {max_date})")
+                    print(f"🔍 Znaleziono {len(pdf_links)} PDF-ów na JUTRO ({tomorrow})")
                     return pdf_links
                 else:
                     print(f"❌ Błąd HTTP: {response.status}")
@@ -255,16 +262,35 @@ async def download_and_convert_pdf(pdf_url):
 async def send_zastepstwa_notification(channel, date_str, version, pdf_url, images):
     """Wyślij powiadomienie z obrazkami ze zastępstw"""
     try:
-        # Informacja o nowych zastępstwach
+        # Ładny embed z informacją
         if version == 0:
-            message = f"🆕 **Nowe zastępstwa na {date_str}**"
+            embed = discord.Embed(
+                title="📋 Nowe zastępstwa",
+                description=f"Dostępne są nowe zastępstwa.",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(TIMEZONE)
+            )
         else:
-            message = f"🔄 **Zaktualizowano zastępstwa na {date_str}** (wersja {version})"
+            embed = discord.Embed(
+                title="🔄 Zaktualizowano zastępstwa",
+                description=f"Zastępstwa zostały zaktualizowane (wersja {version}).",
+                color=discord.Color.orange(),
+                timestamp=datetime.now(TIMEZONE)
+            )
         
-        message += f"\n📄 [Pobierz PDF]({pdf_url})"
-        message += f"\n📄 Liczba stron: {len(images)}"
+        # Parsuj datę do polskiego formatu
+        pdf_date = datetime.strptime(date_str, '%Y-%m-%d')
+        days_pl = ['Poniedziałek', 'Wtorek', 'Środa', 'Czwartek', 'Piątek', 'Sobota', 'Niedziela']
+        day_name = days_pl[pdf_date.weekday()]
+        formatted_date = f"{day_name}, {pdf_date.strftime('%d.%m.%Y')}"
         
-        await channel.send(message)
+        embed.add_field(name="📅 Data zastępstw", value=formatted_date, inline=False)
+        embed.add_field(name="📄 Link do pobrania", value=f"[Otwórz PDF]({pdf_url})", inline=False)
+        embed.add_field(name="📊 Liczba stron", value=f"{len(images)} stron", inline=False)
+        
+        embed.set_footer(text="Zastępstwa | Kopernikus")
+        
+        await channel.send(embed=embed)
         
         # Wyślij każdą stronę jako osobny obrazek
         for i, image in enumerate(images, 1):
@@ -273,9 +299,19 @@ async def send_zastepstwa_notification(channel, date_str, version, pdf_url, imag
             image.save(img_byte_arr, format='PNG')
             img_byte_arr.seek(0)
             
-            # Wyślij jako załącznik
-            file = discord.File(img_byte_arr, filename=f"zastepstwa_{date_str}_v{version}_strona_{i}.png")
-            await channel.send(f"📄 Strona {i}/{len(images)}", file=file)
+            # Wyślij jako załącznik z ładnym embedem
+            page_embed = discord.Embed(
+                title=f"📄 Strona {i}/{len(images)}",
+                color=discord.Color.green(),
+                timestamp=datetime.now(TIMEZONE)
+            )
+            page_embed.add_field(name="📅 Data", value=formatted_date, inline=True)
+            page_embed.add_field(name="🔢 Strona", value=f"{i} z {len(images)}", inline=True)
+            
+            file = discord.File(img_byte_arr, filename=f"zastepstwa_{date_str}_strona_{i}.png")
+            page_embed.set_image(url=f"attachment://zastepstwa_{date_str}_strona_{i}.png")
+            
+            await channel.send(embed=page_embed, file=file)
         
         print(f"📤 Wysłano {len(images)} stron dla {date_str} wersja {version}")
         
@@ -289,7 +325,7 @@ async def check_for_changes():
     pdf_links = await fetch_pdf_links()
     
     if not pdf_links:
-        print("⚠️ Nie znaleziono PDF-ów na jutro/pojutrze")
+        print("⚠️ Nie znaleziono PDF-ów na jutro")
         return
     
     channel = bot.get_channel(CHANNEL_ID)
@@ -305,32 +341,35 @@ async def check_for_changes():
         version = pdf_info['version']
         pdf_url = pdf_info['url']
         
-        print(f"📄 Sprawdzam {date_str} wersja {version}")
+        print(f"📄 Sprawdzam {date_str} v{version}...")
         
         # Sprawdź czy już mamy ten PDF w bazie
         if check_pdf_exists(date_str, version):
-            print(f"✅ PDF już istnieje w bazie: {date_str} v{version}, pomijam")
+            print(f"   ✅ Już w bazie, pomijam")
             continue
         
         # Nowy PDF! Pobierz i konwertuj
         try:
-            print(f"🆕 Nowy PDF! Pobieram {date_str} v{version}...")
+            print(f"   🆕 Nowy! Pobieram...")
             images = await download_and_convert_pdf(pdf_url)
             
             if images is None or len(images) == 0:
-                print(f"⚠️ Nie udało się skonwertować PDF: {pdf_url}")
+                print(f"   ❌ Nie udało się skonwertować")
                 continue
+            
+            print(f"   ✅ Skonwertowano {len(images)} stron")
             
             # Zapisz metadane do bazy
             save_pdf_metadata(date_str, version, pdf_url, len(images))
             
             # Wyślij powiadomienie z obrazkami
+            print(f"   📤 Wysyłam na Discord...")
             await send_zastepstwa_notification(channel, date_str, version, pdf_url, images)
             
-            print(f"📤 ✅ Wysłano powiadomienie dla {date_str} wersja {version}")
+            print(f"   ✅ Gotowe!")
             
         except Exception as e:
-            print(f"❌ Błąd podczas przetwarzania PDF {pdf_url}: {e}")
+            print(f"   ❌ Błąd: {e}")
             continue
     
     print(f"✅ Zakończono sprawdzanie")
