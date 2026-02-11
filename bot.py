@@ -5,9 +5,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import os
 import json
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import Json, RealDictCursor
 import pytz
 import re
 import io
@@ -21,166 +18,50 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 TIMEZONE = pytz.timezone('Europe/Warsaw')
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID'))
-DATABASE_URL = os.getenv('DATABASE_URL')
+SENT_PDFS_FILE = '/tmp/sent_pdfs.json'  # Plik z listą wysłanych PDF-ów
 
-# Connection pool dla bazy danych
-db_pool = None
+# ===== FUNKCJE ZARZĄDZANIA WYSŁANYMI PDF-AMI =====
 
-# ===== FUNKCJE BAZY DANYCH =====
-
-def init_db_pool():
-    """Inicjalizuj connection pool"""
-    global db_pool
+def load_sent_pdfs():
+    """Załaduj listę wysłanych PDF-ów"""
     try:
-        db_pool = pool.SimpleConnectionPool(
-            1, 10,  # min 1, max 10 połączeń
-            DATABASE_URL,
-            connect_timeout=10
-        )
-        print("✅ Pool połączeń z bazą danych zainicjalizowany")
-        return True
+        if os.path.exists(SENT_PDFS_FILE):
+            with open(SENT_PDFS_FILE, 'r') as f:
+                return json.load(f)
+        return {}
     except Exception as e:
-        print(f"❌ Błąd inicjalizacji pool: {e}")
-        db_pool = None
-        return False
+        print(f"❌ Błąd wczytywania listy: {e}")
+        return {}
 
-def get_db_connection():
-    """Pobierz połączenie z pool"""
-    global db_pool
-    if db_pool is None:
-        print("❌ Pool nie jest zainicjalizowany! Próbuję zainicjalizować...")
-        if not init_db_pool():
-            return None
-    
+def save_sent_pdf(date_str, version):
+    """Zapisz informację że PDF został wysłany"""
     try:
-        return db_pool.getconn()
-    except Exception as e:
-        print(f"❌ Błąd pobierania połączenia: {e}")
-        return None
-
-def return_db_connection(conn):
-    """Zwróć połączenie do pool"""
-    global db_pool
-    if db_pool is None or conn is None:
-        return
-    
-    try:
-        db_pool.putconn(conn)
-    except Exception as e:
-        print(f"❌ Błąd zwracania połączenia: {e}")
-
-def init_db():
-    """Inicjalizacja tabel w bazie danych"""
-    conn = get_db_connection()
-    if not conn:
-        print("❌ Nie można połączyć z bazą danych!")
-        return
-    
-    try:
-        cur = conn.cursor()
+        sent_pdfs = load_sent_pdfs()
+        key = f"{date_str}-v{version}"
+        sent_pdfs[key] = {
+            'date': date_str,
+            'version': version,
+            'sent_at': datetime.now(TIMEZONE).isoformat()
+        }
         
-        # Usuń stare tabele jeśli istnieją (migracja)
-        try:
-            cur.execute('DROP TABLE IF EXISTS zastepstwa CASCADE')
-            print("🗑️ Usunięto stare tabele (migracja)")
-        except Exception as e:
-            print(f"⚠️ Błąd podczas usuwania starych tabel: {e}")
+        with open(SENT_PDFS_FILE, 'w') as f:
+            json.dump(sent_pdfs, f, indent=2)
         
-        # Tabela z aktualnymi zastępstwami - przechowuje tylko metadane
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS zastepstwa (
-                id SERIAL PRIMARY KEY,
-                date DATE NOT NULL,
-                version INTEGER NOT NULL DEFAULT 0,
-                pdf_url TEXT NOT NULL,
-                num_pages INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(date, version)
-            )
-        ''')
-        
-        # Indeksy dla lepszej wydajności
-        cur.execute('''
-            CREATE INDEX IF NOT EXISTS idx_zastepstwa_date 
-            ON zastepstwa(date, version DESC)
-        ''')
-        
-        conn.commit()
-        cur.close()
-        print("✅ Baza danych zainicjalizowana")
+        print(f"💾 Zapisano: {key}")
     except Exception as e:
-        print(f"❌ Błąd inicjalizacji bazy: {e}")
-    finally:
-        return_db_connection(conn)
+        print(f"❌ Błąd zapisywania: {e}")
 
-def check_pdf_exists(date_str, version):
-    """Sprawdź czy PDF już istnieje w bazie"""
-    conn = get_db_connection()
-    if not conn:
-        return False
-    
-    try:
-        cur = conn.cursor()
-        cur.execute('SELECT pdf_url FROM zastepstwa WHERE date = %s AND version = %s', (date_str, version))
-        result = cur.fetchone()
-        cur.close()
-        return result is not None
-    except Exception as e:
-        print(f"❌ Błąd podczas sprawdzania bazy: {e}")
-        return False
-    finally:
-        return_db_connection(conn)
+def was_pdf_sent(date_str, version):
+    """Sprawdź czy PDF już został wysłany"""
+    sent_pdfs = load_sent_pdfs()
+    key = f"{date_str}-v{version}"
+    return key in sent_pdfs
 
-def save_pdf_metadata(date_str, version, pdf_url, num_pages):
-    """Zapisz metadane PDF do bazy danych"""
-    conn = get_db_connection()
-    if not conn:
-        print("❌ Nie można połączyć z bazą")
-        return
-    
-    try:
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO zastepstwa (date, version, pdf_url, num_pages, updated_at) 
-            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (date, version) 
-            DO UPDATE SET 
-                pdf_url = EXCLUDED.pdf_url,
-                num_pages = EXCLUDED.num_pages,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (date_str, version, pdf_url, num_pages))
-        conn.commit()
-        cur.close()
-        print(f"💾 Zapisano metadane dla {date_str} wersja {version} do bazy")
-    except Exception as e:
-        print(f"❌ Błąd podczas zapisywania do bazy: {e}")
-    finally:
-        return_db_connection(conn)
-
-def get_all_dates_from_db():
-    """Pobierz wszystkie daty z bazy danych"""
-    conn = get_db_connection()
-    if not conn:
-        return []
-    
-    try:
-        cur = conn.cursor()
-        cur.execute('SELECT DISTINCT date, MAX(version) as latest_version FROM zastepstwa GROUP BY date ORDER BY date DESC')
-        dates = [(row[0].strftime('%Y-%m-%d'), row[1]) for row in cur.fetchall()]
-        cur.close()
-        return dates
-    except Exception as e:
-        print(f"❌ Błąd podczas pobierania dat: {e}")
-        return []
-    finally:
-        return_db_connection(conn)
-
-# ===== FUNKCJE SCRAPOWANIA I PARSOWANIA PDF =====
+# ===== FUNKCJE SCRAPOWANIA =====
 
 async def fetch_pdf_links():
     """Pobierz linki do PDF-ów ze strony zastępstw"""
-    url = "https://kopernikus.pl/zastepstwa"
+    url = "https://www.kopernikus.pl/zastepstwa"
     
     # Sprawdzaj TYLKO JUTRO
     today = datetime.now(TIMEZONE).date()
@@ -193,25 +74,20 @@ async def fetch_pdf_links():
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
                     
-                    # Znajdź wszystkie linki do PDF-ów
                     pdf_links = []
                     
-                    # Szukaj linków w formacie: /upload/zastepstwa/YYYY-MM-DD-V.pdf lub upload/zastepstwa/YYYY-MM-DD-V.pdf
                     for link in soup.find_all('a', href=True):
                         href = link['href']
-                        # Sprawdź czy to link do PDF zastępstw (może być z / lub bez)
                         match = re.search(r'/?upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
                         if match:
                             date_str = match.group(1)
                             version = int(match.group(2))
                             
-                            # Parsuj datę
                             try:
                                 pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
                                 
-                                # Sprawdź czy to JUTRO
+                                # TYLKO JUTRO
                                 if pdf_date == tomorrow:
-                                    # Buduj pełny URL
                                     if href.startswith('http'):
                                         full_url = href
                                     elif href.startswith('/'):
@@ -225,7 +101,6 @@ async def fetch_pdf_links():
                                         'url': full_url
                                     })
                             except ValueError:
-                                print(f"⚠️ Nie można sparsować daty: {date_str}")
                                 continue
                     
                     print(f"🔍 Znaleziono {len(pdf_links)} PDF-ów na JUTRO ({tomorrow})")
@@ -234,7 +109,7 @@ async def fetch_pdf_links():
                     print(f"❌ Błąd HTTP: {response.status}")
                     return []
         except Exception as e:
-            print(f"❌ Błąd podczas pobierania listy PDF-ów: {e}")
+            print(f"❌ Błąd pobierania strony: {e}")
             return []
 
 async def download_and_convert_pdf(pdf_url):
@@ -244,25 +119,28 @@ async def download_and_convert_pdf(pdf_url):
             async with session.get(pdf_url, timeout=30) as response:
                 if response.status == 200:
                     pdf_content = await response.read()
-                    
-                    # Konwertuj PDF na obrazki (PIL Images)
                     images = convert_from_bytes(pdf_content, dpi=200)
-                    
-                    print(f"✅ Skonwertowano PDF na {len(images)} stron")
+                    print(f"   ✅ Skonwertowano {len(images)} stron")
                     return images
                 else:
-                    print(f"❌ Błąd pobierania PDF: {response.status}")
+                    print(f"   ❌ Błąd HTTP: {response.status}")
                     return None
         except Exception as e:
-            print(f"❌ Błąd podczas konwersji PDF {pdf_url}: {e}")
+            print(f"   ❌ Błąd konwersji: {e}")
             return None
 
-# ===== FUNKCJE PORÓWNYWANIA I POWIADOMIEŃ =====
+# ===== WYSYŁANIE POWIADOMIEŃ =====
 
 async def send_zastepstwa_notification(channel, date_str, version, pdf_url, images):
-    """Wyślij powiadomienie z obrazkami ze zastępstw"""
+    """Wyślij powiadomienie z obrazkami"""
     try:
-        # Ładny embed z informacją
+        # Parsuj datę
+        pdf_date = datetime.strptime(date_str, '%Y-%m-%d')
+        days_pl = ['Poniedziałek', 'Wtorek', 'Środa', 'Czwartek', 'Piątek', 'Sobota', 'Niedziela']
+        day_name = days_pl[pdf_date.weekday()]
+        formatted_date = f"{day_name}, {pdf_date.strftime('%d.%m.%Y')}"
+        
+        # Główny embed
         if version == 0:
             embed = discord.Embed(
                 title="📋 Nowe zastępstwa",
@@ -278,28 +156,19 @@ async def send_zastepstwa_notification(channel, date_str, version, pdf_url, imag
                 timestamp=datetime.now(TIMEZONE)
             )
         
-        # Parsuj datę do polskiego formatu
-        pdf_date = datetime.strptime(date_str, '%Y-%m-%d')
-        days_pl = ['Poniedziałek', 'Wtorek', 'Środa', 'Czwartek', 'Piątek', 'Sobota', 'Niedziela']
-        day_name = days_pl[pdf_date.weekday()]
-        formatted_date = f"{day_name}, {pdf_date.strftime('%d.%m.%Y')}"
-        
         embed.add_field(name="📅 Data zastępstw", value=formatted_date, inline=False)
         embed.add_field(name="📄 Link do pobrania", value=f"[Otwórz PDF]({pdf_url})", inline=False)
         embed.add_field(name="📊 Liczba stron", value=f"{len(images)} stron", inline=False)
-        
         embed.set_footer(text="Zastępstwa | Kopernikus")
         
         await channel.send(embed=embed)
         
-        # Wyślij każdą stronę jako osobny obrazek
+        # Wyślij każdą stronę
         for i, image in enumerate(images, 1):
-            # Konwertuj PIL Image do bytes
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='PNG')
             img_byte_arr.seek(0)
             
-            # Wyślij jako załącznik z ładnym embedem
             page_embed = discord.Embed(
                 title=f"📄 Strona {i}/{len(images)}",
                 color=discord.Color.green(),
@@ -313,10 +182,12 @@ async def send_zastepstwa_notification(channel, date_str, version, pdf_url, imag
             
             await channel.send(embed=page_embed, file=file)
         
-        print(f"📤 Wysłano {len(images)} stron dla {date_str} wersja {version}")
+        print(f"   📤 Wysłano {len(images)} stron")
         
     except Exception as e:
-        print(f"❌ Błąd podczas wysyłania powiadomienia: {e}")
+        print(f"   ❌ Błąd wysyłania: {e}")
+
+# ===== GŁÓWNA LOGIKA =====
 
 async def check_for_changes():
     """Sprawdź zmiany w zastępstwach"""
@@ -333,22 +204,29 @@ async def check_for_changes():
         print(f"❌ Nie znaleziono kanału o ID: {CHANNEL_ID}")
         return
     
-    # Sprawdź każdy PDF (posortowane od najnowszych)
-    pdf_links_sorted = sorted(pdf_links, key=lambda x: (x['date'], x['version']), reverse=True)
-    
-    for pdf_info in pdf_links_sorted:
+    # Sortuj po wersji - najnowsza najpierw
+    # WAŻNE: Wysyłamy TYLKO najnowszą wersję dla danej daty!
+    pdf_by_date = {}
+    for pdf_info in pdf_links:
         date_str = pdf_info['date']
+        version = pdf_info['version']
+        
+        if date_str not in pdf_by_date or version > pdf_by_date[date_str]['version']:
+            pdf_by_date[date_str] = pdf_info
+    
+    # Teraz mamy tylko najnowszą wersję każdej daty
+    for date_str, pdf_info in pdf_by_date.items():
         version = pdf_info['version']
         pdf_url = pdf_info['url']
         
-        print(f"📄 Sprawdzam {date_str} v{version}...")
+        print(f"📄 {date_str} v{version}")
         
-        # Sprawdź czy już mamy ten PDF w bazie
-        if check_pdf_exists(date_str, version):
-            print(f"   ✅ Już w bazie, pomijam")
+        # Sprawdź czy już wysłano
+        if was_pdf_sent(date_str, version):
+            print(f"   ✅ Już wysłane, pomijam")
             continue
         
-        # Nowy PDF! Pobierz i konwertuj
+        # Nowy PDF!
         try:
             print(f"   🆕 Nowy! Pobieram...")
             images = await download_and_convert_pdf(pdf_url)
@@ -357,163 +235,97 @@ async def check_for_changes():
                 print(f"   ❌ Nie udało się skonwertować")
                 continue
             
-            print(f"   ✅ Skonwertowano {len(images)} stron")
-            
-            # Zapisz metadane do bazy
-            save_pdf_metadata(date_str, version, pdf_url, len(images))
-            
-            # Wyślij powiadomienie z obrazkami
-            print(f"   📤 Wysyłam na Discord...")
+            # Wyślij
+            print(f"   📤 Wysyłam...")
             await send_zastepstwa_notification(channel, date_str, version, pdf_url, images)
+            
+            # Zapisz że wysłano
+            save_sent_pdf(date_str, version)
             
             print(f"   ✅ Gotowe!")
             
         except Exception as e:
             print(f"   ❌ Błąd: {e}")
-            continue
     
-    print(f"✅ Zakończono sprawdzanie")
+    print(f"✅ Zakończono")
 
-# ===== EVENTY I TASKI BOTA =====
+# ===== EVENTY =====
 
 @bot.event
 async def on_ready():
-    print(f'✅ Bot zalogowany jako {bot.user}')
-    print(f'📊 Połączono z {len(bot.guilds)} serwerami')
+    print(f'✅ Bot: {bot.user}')
+    print(f'📊 Serwery: {len(bot.guilds)}')
+    print(f'📁 Lista wysłanych: {SENT_PDFS_FILE}')
     
-    # Inicjalizacja bazy danych
-    init_db()
+    # Pokaż co już wysłano
+    sent = load_sent_pdfs()
+    if sent:
+        print(f"📋 Już wysłane PDF-y: {len(sent)}")
+        for key in list(sent.keys())[-5:]:  # Ostatnie 5
+            print(f"   - {key}")
     
-    print("🔍 Bot gotowy - będzie wysyłał powiadomienia tylko o PRZYSZŁYCH zastępstwach (od jutra)")
-    
-    # Uruchom task sprawdzający zastępstwa
     if not check_zastepstwa_task.is_running():
         check_zastepstwa_task.start()
-        print("🔄 Uruchomiono automatyczne sprawdzanie zastępstw co 15 minut")
+        print("🔄 Automatyczne sprawdzanie: co 15 min")
 
-@tasks.loop(minutes=15)  # Sprawdzaj co 15 minut
+@tasks.loop(minutes=15)
 async def check_zastepstwa_task():
     await check_for_changes()
 
 @check_zastepstwa_task.before_loop
-async def before_check_zastepstwa():
+async def before_check():
     await bot.wait_until_ready()
-    print("⏳ Czekam na gotowość bota...")
 
 # ===== KOMENDY =====
 
 @bot.command(name='sprawdz')
 async def sprawdz_command(ctx):
-    """Ręczne sprawdzenie zastępstw"""
-    await ctx.send("🔍 Sprawdzam zastępstwa...")
+    """Ręczne sprawdzenie"""
+    await ctx.send("🔍 Sprawdzam...")
     await check_for_changes()
-
-@bot.command(name='pokaz')
-async def pokaz_command(ctx):
-    """Pokaż zastępstwa zapisane w bazie"""
-    dates = get_all_dates_from_db()
-    if dates:
-        dates_str = "\n".join([f"{d[0]} (wersja {d[1]})" for d in dates])
-        await ctx.send(f"📅 Zastępstwa w bazie:\n```{dates_str}```")
-    else:
-        await ctx.send("❌ Brak danych w bazie")
 
 @bot.command(name='status')
 async def status_command(ctx):
-    """Pokaż status bota i bazy danych"""
+    """Status bota"""
+    sent = load_sent_pdfs()
+    
+    embed = discord.Embed(
+        title="📊 Status Bota",
+        color=discord.Color.green(),
+        timestamp=datetime.now(TIMEZONE)
+    )
+    embed.add_field(name="Wysłanych PDF-ów", value=str(len(sent)), inline=True)
+    embed.add_field(name="Task aktywny", value="✅ Tak" if check_zastepstwa_task.is_running() else "❌ Nie", inline=True)
+    
+    if sent:
+        latest = list(sent.values())[-3:]
+        latest_str = "\n".join([f"{p['date']} v{p['version']}" for p in latest])
+        embed.add_field(name="Ostatnio wysłane", value=latest_str, inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='reset')
+async def reset_command(ctx):
+    """Wyczyść listę wysłanych (ADMIN)"""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Policz rekordy
-        cur.execute('SELECT COUNT(DISTINCT date) FROM zastepstwa')
-        count_dates = cur.fetchone()[0]
-        
-        cur.execute('SELECT COUNT(*) FROM zastepstwa')
-        count_versions = cur.fetchone()[0]
-        
-        # Najnowsza aktualizacja
-        cur.execute('SELECT MAX(updated_at) FROM zastepstwa')
-        last_update = cur.fetchone()[0]
-        
-        # Najnowsze zastępstwa
-        cur.execute('SELECT date, version, num_pages FROM zastepstwa ORDER BY date DESC, version DESC LIMIT 5')
-        latest = cur.fetchall()
-        
-        cur.close()
-        conn.close()
-        
-        embed = discord.Embed(
-            title="📊 Status Bota",
-            color=discord.Color.green(),
-            timestamp=datetime.now(TIMEZONE)
-        )
-        embed.add_field(name="Różnych dat", value=str(count_dates), inline=True)
-        embed.add_field(name="Wersji łącznie", value=str(count_versions), inline=True)
-        embed.add_field(name="Ostatnia aktualizacja", value=str(last_update) if last_update else "Brak", inline=False)
-        embed.add_field(name="Task aktywny", value="✅ Tak" if check_zastepstwa_task.is_running() else "❌ Nie", inline=True)
-        
-        if latest:
-            latest_str = "\n".join([f"{row[0]} (v{row[1]}, {row[2]} stron)" for row in latest])
-            embed.add_field(name="Najnowsze zastępstwa", value=latest_str, inline=False)
-        
-        await ctx.send(embed=embed)
-        
+        if os.path.exists(SENT_PDFS_FILE):
+            os.remove(SENT_PDFS_FILE)
+        await ctx.send("✅ Lista wysłanych została wyczyszczona!")
     except Exception as e:
         await ctx.send(f"❌ Błąd: {e}")
 
-@bot.command(name='debug')
-async def debug_command(ctx):
-    """Debug: pokaż wszystkie znalezione PDF-y na stronie"""
-    await ctx.send("🔍 Szukam PDF-ów na stronie...")
-    
-    url = "https://kopernikus.pl/zastepstwa"
-    today = datetime.now(TIMEZONE).date()
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, timeout=30) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    all_pdfs = []
-                    for link in soup.find_all('a', href=True):
-                        href = link['href']
-                        match = re.search(r'/?upload/zastepstwa/(\d{4}-\d{2}-\d{2})-(\d+)\.pdf', href)
-                        if match:
-                            date_str = match.group(1)
-                            version = int(match.group(2))
-                            pdf_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-                            is_future = "✅" if pdf_date >= today else "⏭️"
-                            all_pdfs.append(f"{is_future} {date_str} v{version}")
-                    
-                    if all_pdfs:
-                        pdfs_text = "\n".join(all_pdfs[:20])  # Max 20
-                        await ctx.send(f"📄 Znalezione PDF-y:\n```\n{pdfs_text}\n```\n✅ = aktualny/przyszły | ⏭️ = przeszły\nDzisiaj: {today}")
-                    else:
-                        await ctx.send("❌ Nie znaleziono żadnych PDF-ów")
-                else:
-                    await ctx.send(f"❌ Błąd HTTP: {response.status}")
-        except Exception as e:
-            await ctx.send(f"❌ Błąd: {e}")
-
-# ===== URUCHOMIENIE BOTA =====
+# ===== START =====
 
 if __name__ == "__main__":
     TOKEN = os.getenv('DISCORD_BOT_TOKEN')
     
     if not TOKEN:
-        print("❌ Brak tokena Discord! Ustaw zmienną DISCORD_BOT_TOKEN")
-        exit(1)
-    
-    if not DATABASE_URL:
-        print("❌ Brak URL bazy danych! Ustaw zmienną DATABASE_URL")
+        print("❌ Brak DISCORD_BOT_TOKEN!")
         exit(1)
     
     if not CHANNEL_ID:
-        print("❌ Brak ID kanału! Ustaw zmienną DISCORD_CHANNEL_ID")
+        print("❌ Brak DISCORD_CHANNEL_ID!")
         exit(1)
     
-    print("🚀 Uruchamiam bota...")
+    print("🚀 Uruchamiam...")
     bot.run(TOKEN)
